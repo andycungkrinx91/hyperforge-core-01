@@ -8,7 +8,7 @@ import (
 
 func TestStoreRepoIssuePullLifecycle(t *testing.T) {
 	store := NewStore("adaiversen", "tok", "2026-11-14T00:00:00Z")
-	srv := &EpollServer{store: store, scratch: make([]byte, 0, 8192)}
+	srv := &EpollServer{store: store}
 
 	// Auth failure
 	r := &Request{Method: []byte("GET"), Path: []byte("/api/v3/user/repos"), KeepAlive: true}
@@ -102,5 +102,43 @@ func TestStoreRepoIssuePullLifecycle(t *testing.T) {
 	}
 	if _, hasErr := parsed["errors"]; !hasErr {
 		t.Fatalf("expected GraphQL errors array, got %v", parsed)
+	}
+}
+
+func TestConcurrentHotPathsRaceFree(t *testing.T) {
+	store := NewStore("adaiversen", "tok", "2026-11-14T00:00:00Z")
+	srv := &EpollServer{store: store}
+	auth := []byte("Bearer tok")
+
+	repo, _ := store.CreateRepo("bench-race", "", true)
+	is, _ := store.CreateIssue(repo, "Hot issue", "Body", nil)
+	_ = is
+
+	// Warm caches
+	srv.dispatch(&Request{Method: []byte("GET"), Path: []byte("/api/v3/repos/adaiversen/bench-race/issues/1"), Auth: auth, KeepAlive: true})
+	srv.dispatch(&Request{Method: []byte("GET"), Path: []byte("/adaiversen/bench-race.git/info/refs"), Query: []byte("service=git-receive-pack"), Auth: auth, KeepAlive: true})
+
+	done := make(chan struct{}, 20)
+	for g := 0; g < 20; g++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			for i := 0; i < 50; i++ {
+				r1 := srv.dispatch(&Request{Method: []byte("GET"), Path: []byte("/api/v3/repos/adaiversen/bench-race/issues/1"), Auth: auth, KeepAlive: true})
+				if !bytes.HasPrefix(r1, []byte("HTTP/1.1 200")) {
+					t.Errorf("unexpected issue read status")
+				}
+				r2 := srv.dispatch(&Request{Method: []byte("GET"), Path: []byte("/adaiversen/bench-race.git/info/refs"), Query: []byte("service=git-upload-pack"), GitProtocol: []byte("version=2"), Auth: auth, KeepAlive: true})
+				if !bytes.HasPrefix(r2, []byte("HTTP/1.1 200")) {
+					t.Errorf("unexpected git adv status")
+				}
+				r3 := srv.dispatch(&Request{Method: []byte("GET"), Path: []byte("/adaiversen/bench-race.git/info/refs"), Query: []byte("service=git-receive-pack"), Auth: auth, KeepAlive: true})
+				if !bytes.HasPrefix(r3, []byte("HTTP/1.1 200")) {
+					t.Errorf("unexpected recv adv status")
+				}
+			}
+		}()
+	}
+	for g := 0; g < 20; g++ {
+		<-done
 	}
 }

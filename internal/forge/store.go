@@ -8,6 +8,8 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // ObjType matches Git packfile object type numbers.
@@ -113,20 +115,33 @@ type GitObj struct {
 	Type    ObjType
 	OID     OID
 	Data    []byte
-	ZlibRaw []byte // cached zlib-compressed payload (populated lazily or on ingest)
+	ZlibRaw []byte // cached zlib-compressed payload (populated lazily on fetch/clone)
 
-	// Commit metadata (only populated for ObjCommit)
-	TreeOID   OID
-	Parents   []OID
-	Message   string
-	Author    string
-	Committer string
-	Parsed    bool
+	// Commit metadata (inline Parent0 avoids slice alloc on linear commits!)
+	TreeOID    OID
+	Parent0    OID
+	HasParent0 bool
+	Parents    []OID // extra parents (index 1+), only allocated for merge commits
+	Parsed     bool
 
 	// Tag metadata (only populated for ObjTag)
 	TagTarget OID
 	TagType   string
 	TagName   string
+}
+
+func (o *GitObj) HasParents() bool {
+	return o.HasParent0 || len(o.Parents) > 0
+}
+
+func (o *GitObj) AppendParents(dst []OID) []OID {
+	if o.HasParent0 {
+		dst = append(dst, o.Parent0)
+	}
+	if len(o.Parents) > 0 {
+		dst = append(dst, o.Parents...)
+	}
+	return dst
 }
 
 type Label struct {
@@ -156,12 +171,12 @@ type Issue struct {
 	CreatedAt string
 	UpdatedAt string
 
-	// Complete pre-rendered HTTP/1.1 200 OK response for GET /api/v3/repos/{o}/{r}/issues/{n}.
-	cachedGetResp []byte
+	// Complete pre-rendered HTTP/1.1 200 OK response for lock-free GET /api/v3/repos/{o}/{r}/issues/{n}.
+	cachedGetResp atomic.Pointer[[]byte]
 }
 
 func (is *Issue) InvalidateCache() {
-	is.cachedGetResp = nil
+	is.cachedGetResp.Store(nil)
 }
 
 type PullRequest struct {
@@ -183,6 +198,11 @@ type PullRequest struct {
 	UpdatedAt      string
 }
 
+type fetchCacheEntry struct {
+	key  []byte
+	resp []byte
+}
+
 type Repo struct {
 	ID            int
 	NodeID        string
@@ -201,61 +221,110 @@ type Repo struct {
 	Issues []*Issue       // 0-indexed: Issues[number-1]
 	Pulls  []*PullRequest // 0-indexed: Pulls[number-1]
 
-	// Wire caches invalidated whenever RefGen increments.
+	// Lock-free atomic snapshots for hot read/clone/push-adv endpoints.
+	issuesSnap atomic.Pointer[[]*Issue]
+	fetchCache atomic.Pointer[[]fetchCacheEntry]
+	recvCache  atomic.Pointer[[]byte]
+	upV0Cache  atomic.Pointer[[]byte]
+
+	// Wire cache metadata protected by Store.mu.
 	RefGen              uint64
-	cachedRecvGen       uint64
-	cachedRecvHTTP      []byte
 	cachedRecvSingleRef string
 	cachedRecvOIDOff    int
-	cachedUpV0Gen       uint64
-	cachedUpV0HTTP      []byte
-	cachedLsRefsGen     uint64
-	cachedLsRefs        map[string][]byte
-	cachedFetchGen      uint64
-	cachedFetch         map[string][]byte
+
+	// Slab allocators (protected by Store.mu) to eliminate per-object GC churn on push.
+	objSlab  []GitObj
+	dataSlab []byte
+}
+
+func (r *Repo) allocObj() *GitObj {
+	if len(r.objSlab) == 0 {
+		r.objSlab = make([]GitObj, 64)
+	}
+	o := &r.objSlab[0]
+	r.objSlab = r.objSlab[1:]
+	return o
+}
+
+func (r *Repo) allocData(n int) []byte {
+	if n == 0 {
+		return nil
+	}
+	if n > 4096 {
+		return make([]byte, n)
+	}
+	if len(r.dataSlab) < n {
+		r.dataSlab = make([]byte, 32768)
+	}
+	b := r.dataSlab[:n:n]
+	r.dataSlab = r.dataSlab[n:]
+	return b
 }
 
 func (r *Repo) BumpRefGen() {
 	r.RefGen++
-	r.cachedRecvHTTP = nil
+	r.recvCache.Store(nil)
 	r.cachedRecvSingleRef = ""
 	r.cachedRecvOIDOff = 0
-	r.cachedUpV0HTTP = nil
-	if len(r.cachedLsRefs) > 0 {
-		clear(r.cachedLsRefs)
-	}
-	if len(r.cachedFetch) > 0 {
-		clear(r.cachedFetch)
-	}
+	r.upV0Cache.Store(nil)
+	r.fetchCache.Store(nil)
 }
 
-// PatchSingleRefCache updates cachedRecvHTTP in-place when a 1-ref repo advances its single ref.
+func (r *Repo) setRecvCache(httpBytes []byte, singleRef string, oidOff int) {
+	r.cachedRecvSingleRef = singleRef
+	r.cachedRecvOIDOff = oidOff
+	r.recvCache.Store(&httpBytes)
+}
+
+func (r *Repo) putFetchCache(key, resp []byte) {
+	var cur []fetchCacheEntry
+	if p := r.fetchCache.Load(); p != nil {
+		cur = *p
+	}
+	if len(cur) >= 32 {
+		return
+	}
+	for i := range cur {
+		if bytes.Equal(cur[i].key, key) {
+			return
+		}
+	}
+	keyCopy := make([]byte, len(key))
+	copy(keyCopy, key)
+	next := make([]fetchCacheEntry, len(cur)+1)
+	copy(next, cur)
+	next[len(cur)] = fetchCacheEntry{key: keyCopy, resp: resp}
+	r.fetchCache.Store(&next)
+}
+
+// PatchSingleRefCache updates recvCache via immutable copy-on-write when a 1-ref repo advances.
 func (r *Repo) PatchSingleRefCache(ref string, newOID OID) {
 	r.RefGen++
-	r.cachedUpV0HTTP = nil
-	if len(r.cachedLsRefs) > 0 {
-		clear(r.cachedLsRefs)
-	}
-	if len(r.cachedFetch) > 0 {
-		clear(r.cachedFetch)
-	}
-	if len(r.Refs) == 1 && r.cachedRecvHTTP != nil && r.cachedRecvSingleRef == ref && r.cachedRecvOIDOff > 0 && r.cachedRecvOIDOff+40 <= len(r.cachedRecvHTTP) {
+	r.upV0Cache.Store(nil)
+	r.fetchCache.Store(nil)
+	prevPtr := r.recvCache.Load()
+	if len(r.Refs) == 1 && prevPtr != nil && r.cachedRecvSingleRef == ref && r.cachedRecvOIDOff > 0 && r.cachedRecvOIDOff+40 <= len(*prevPtr) {
+		prev := *prevPtr
+		next := make([]byte, len(prev))
+		copy(next, prev)
 		var hexBuf [40]byte
 		for i, b := range newOID {
 			hexBuf[i*2] = hexDigits[b>>4]
 			hexBuf[i*2+1] = hexDigits[b&0x0f]
 		}
-		copy(r.cachedRecvHTTP[r.cachedRecvOIDOff:r.cachedRecvOIDOff+40], hexBuf[:])
-		r.cachedRecvGen = r.RefGen
+		copy(next[r.cachedRecvOIDOff:r.cachedRecvOIDOff+40], hexBuf[:])
+		r.recvCache.Store(&next)
 		return
 	}
-	r.cachedRecvHTTP = nil
+	r.recvCache.Store(nil)
 	r.cachedRecvSingleRef = ""
 	r.cachedRecvOIDOff = 0
 }
 
-// Store holds all forge state. Accessed exclusively from the single-threaded epoll reactor.
+// Store holds all forge state. Mutations & cold reads are serialized by mu; hot reads are lock-free.
 type Store struct {
+	mu sync.Mutex
+
 	ViewerLogin string
 	ViewerName  string
 	ViewerEmail string
@@ -265,28 +334,27 @@ type Store struct {
 	TrialNow    string
 	CommitEpoch int64
 
-	Repos    map[string]*Repo // keyed by repo name (owned by ViewerLogin)
-	RepoList []*Repo          // deterministic creation order (tombstoned entries nilled or removed)
+	Repos     map[string]*Repo // keyed by repo name (owned by ViewerLogin)
+	reposSnap atomic.Pointer[map[string]*Repo]
+	repoEpoch atomic.Uint64
+	RepoList  []*Repo // deterministic creation order
 
 	NextRepoID    int
 	NextLabelID   int
 	NextIssueID   int
 	NextCommentID int
 	NextPRID      int
-	ReqSeq        uint64
 	CommitSeq     int64
 
 	RepoByNode  map[string]*Repo
 	IssueByNode map[string]*Issue
 	PRByNode    map[string]*PullRequest
 
-	// Single-threaded reusable scratch/crypto/compression helpers (zero alloc on hot path).
+	// Reusable crypto/compression helpers (protected by Store.mu).
 	sha1Hasher  hash.Hash
 	zReader     io.ReadCloser
 	zWriter     *zlib.Writer
 	zBuf        bytes.Buffer
-	inflateBuf  bytes.Buffer
-	respScratch []byte
 	reportBuf   []byte
 	sidebandBuf []byte
 }
@@ -312,14 +380,23 @@ func NewStore(login, token, trialNow string) *Store {
 		IssueByNode:   make(map[string]*Issue, 256),
 		PRByNode:      make(map[string]*PullRequest, 64),
 		sha1Hasher:    sha1.New(),
-		respScratch:   make([]byte, 0, 16384),
 	}
 	if login != "adaiversen" {
 		s.ViewerName = login
 	}
 	zw, _ := zlib.NewWriterLevel(&s.zBuf, zlib.BestCompression)
 	s.zWriter = zw
+	emptySnap := make(map[string]*Repo)
+	s.reposSnap.Store(&emptySnap)
 	return s
+}
+
+func (s *Store) publishReposSnapLocked() {
+	cp := make(map[string]*Repo, len(s.Repos))
+	for k, v := range s.Repos {
+		cp[k] = v
+	}
+	s.reposSnap.Store(&cp)
 }
 
 func (s *Store) CheckAuth(authVal []byte) bool {
@@ -345,19 +422,20 @@ func (s *Store) CreateRepo(name, desc string, private bool) (*Repo, bool) {
 		Private:       private,
 		DefaultBranch: "main",
 		CreatedAt:     s.TrialNow,
-		Objects:       make(map[OID]*GitObj, 32),
+		Objects:       make(map[OID]*GitObj, 256),
 		Refs:          make(map[string]OID, 8),
 		HeadRef:       "refs/heads/main",
 		Labels:        make(map[string]*Label, 8),
 		Issues:        make([]*Issue, 0, 16),
 		Pulls:         make([]*PullRequest, 0, 8),
 		RefGen:        1,
-		cachedLsRefs:  make(map[string][]byte, 8),
-		cachedFetch:   make(map[string][]byte, 8),
 	}
+	emptyIssues := r.Issues
+	r.issuesSnap.Store(&emptyIssues)
 	s.Repos[name] = r
 	s.RepoList = append(s.RepoList, r)
 	s.RepoByNode[nodeID] = r
+	s.publishReposSnapLocked()
 	return r, true
 }
 
@@ -373,6 +451,17 @@ func (s *Store) GetRepoBytes(owner, name []byte) *Repo {
 		return nil
 	}
 	return s.Repos[string(name)]
+}
+
+func (s *Store) GetRepoLockFree(owner, name []byte) *Repo {
+	if len(owner) != len(s.ViewerLogin) || string(owner) != s.ViewerLogin {
+		return nil
+	}
+	m := s.reposSnap.Load()
+	if m == nil {
+		return nil
+	}
+	return (*m)[string(name)]
 }
 
 func (s *Store) DeleteRepo(owner, name string) bool {
@@ -397,6 +486,8 @@ func (s *Store) DeleteRepo(owner, name string) bool {
 			break
 		}
 	}
+	s.repoEpoch.Add(1)
+	s.publishReposSnapLocked()
 	return true
 }
 
@@ -446,6 +537,8 @@ func (s *Store) CreateIssue(r *Repo, title, body string, labelNames []string) (*
 		UpdatedAt: s.TrialNow,
 	}
 	r.Issues = append(r.Issues, is)
+	cp := r.Issues
+	r.issuesSnap.Store(&cp)
 	s.IssueByNode[nodeID] = is
 	return is, ""
 }

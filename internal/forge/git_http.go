@@ -55,17 +55,38 @@ func appendSideband(dst []byte, band byte, data []byte) []byte {
 	return dst
 }
 
-// Static pre-built HTTP/1.1 200 OK response for Git v2 upload-pack advertisement (identical for every repo!).
-var staticUploadV2HTTP = func() []byte {
-	var body []byte
-	body = appendPktLineStr(body, "version 2\n")
-	body = appendPktLineStr(body, "agent=hyperforge/1\n")
-	body = appendPktLineStr(body, "ls-refs=unborn\n")
-	body = appendPktLineStr(body, "fetch=shallow\n")
-	body = appendPktLineStr(body, "object-format=sha1\n")
-	body = append(body, pktFlush...)
-	return buildImmutableHTTPResp(200, "application/x-git-upload-pack-advertisement", body)
-}()
+// Static pre-built HTTP/1.1 200 OK responses for Git Smart HTTP hot paths.
+var (
+	staticUploadV2HTTP = func() []byte {
+		var body []byte
+		body = appendPktLineStr(body, "version 2\n")
+		body = appendPktLineStr(body, "agent=hyperforge/1\n")
+		body = appendPktLineStr(body, "ls-refs=unborn\n")
+		body = appendPktLineStr(body, "fetch=shallow\n")
+		body = appendPktLineStr(body, "object-format=sha1\n")
+		body = append(body, pktFlush...)
+		return buildImmutableGitResp(200, "application/x-git-upload-pack-advertisement", body)
+	}()
+
+	staticPushMainPlainResp = func() []byte {
+		var report []byte
+		report = appendPktLineStr(report, "unpack ok\n")
+		report = appendPktLineStr(report, "ok refs/heads/main\n")
+		report = append(report, pktFlush...)
+		return buildImmutableGitResp(200, "application/x-git-receive-pack-result", report)
+	}()
+
+	staticPushMainSidebandResp = func() []byte {
+		var report []byte
+		report = appendPktLineStr(report, "unpack ok\n")
+		report = appendPktLineStr(report, "ok refs/heads/main\n")
+		report = append(report, pktFlush...)
+		var body []byte
+		body = appendSideband(body, 1, report)
+		body = append(body, pktFlush...)
+		return buildImmutableGitResp(200, "application/x-git-receive-pack-result", body)
+	}()
+)
 
 func (s *EpollServer) handleGitHTTP(req *Request) []byte {
 	if !s.store.CheckAuth(req.Auth) {
@@ -138,41 +159,44 @@ func (s *EpollServer) handleGitInfoRefs(req *Request, repo *Repo) []byte {
 			body = append(body, pktFlush...)
 			return s.buildResp(200, "application/x-git-upload-pack-advertisement", body, nil, false)
 		}
-		if req.KeepAlive && repo.cachedUpV0HTTP != nil && repo.cachedUpV0Gen == repo.RefGen {
-			return repo.cachedUpV0HTTP
+		if req.KeepAlive {
+			if cached := repo.upV0Cache.Load(); cached != nil {
+				return *cached
+			}
 		}
 		body := buildV0RefsBody(repo, "git-upload-pack", "multi_ack thin-pack side-band side-band-64k ofs-delta shallow no-progress include-tag symref=HEAD:"+repo.HeadRef+" agent=hyperforge/1", true)
 		if req.KeepAlive {
-			repo.cachedUpV0HTTP = buildImmutableHTTPResp(200, "application/x-git-upload-pack-advertisement", body)
-			repo.cachedUpV0Gen = repo.RefGen
-			return repo.cachedUpV0HTTP
+			httpBytes := buildImmutableGitResp(200, "application/x-git-upload-pack-advertisement", body)
+			repo.upV0Cache.Store(&httpBytes)
+			return httpBytes
 		}
-		return s.buildResp(200, "application/x-git-upload-pack-advertisement", body, nil, false)
+		return s.buildGitResp(200, "application/x-git-upload-pack-advertisement", body, false)
 	}
 
 	if isReceive {
-		if req.KeepAlive && repo.cachedRecvHTTP != nil && repo.cachedRecvGen == repo.RefGen {
-			return repo.cachedRecvHTTP
+		if req.KeepAlive {
+			if cached := repo.recvCache.Load(); cached != nil {
+				return *cached
+			}
 		}
 		body := buildV0RefsBody(repo, "git-receive-pack", "report-status report-status-v2 delete-refs side-band-64k ofs-delta agent=hyperforge/1", false)
 		if req.KeepAlive {
-			httpBytes := buildImmutableHTTPResp(200, "application/x-git-receive-pack-advertisement", body)
-			repo.cachedRecvHTTP = httpBytes
-			repo.cachedRecvGen = repo.RefGen
-			repo.cachedRecvSingleRef = ""
-			repo.cachedRecvOIDOff = 0
+			httpBytes := buildImmutableGitResp(200, "application/x-git-receive-pack-advertisement", body)
+			singleRef := ""
+			oidOff := 0
 			if len(repo.Refs) == 1 {
 				for refName, oid := range repo.Refs {
 					needle := oid.Hex() + " " + refName + "\x00"
 					if idx := bytes.Index(httpBytes, []byte(needle)); idx >= 0 {
-						repo.cachedRecvSingleRef = refName
-						repo.cachedRecvOIDOff = idx
+						singleRef = refName
+						oidOff = idx
 					}
 				}
 			}
-			return repo.cachedRecvHTTP
+			repo.setRecvCache(httpBytes, singleRef, oidOff)
+			return httpBytes
 		}
-		return s.buildResp(200, "application/x-git-receive-pack-advertisement", body, nil, false)
+		return s.buildGitResp(200, "application/x-git-receive-pack-advertisement", body, false)
 	}
 	return s.buildJSONResp(400, "{\"message\":\"unknown service\"}\n", nil, req.KeepAlive)
 }
@@ -289,11 +313,14 @@ func stripLF(b []byte) []byte {
 }
 
 func (s *EpollServer) handleGitUploadPack(req *Request, repo *Repo) []byte {
-	isV2 := bytes.Contains(req.GitProtocol, []byte("version=2"))
-	// Fast cache hit for exact v2 request body (e.g. 50 concurrent shallow clones!)
-	if isV2 && req.KeepAlive && repo.cachedFetchGen == repo.RefGen {
-		if cached, ok := repo.cachedFetch[string(req.Body)]; ok {
-			return cached
+	isV2 := bytes.Contains(req.GitProtocol, v2ProtoBytes)
+	if isV2 && req.KeepAlive {
+		if fc := repo.fetchCache.Load(); fc != nil {
+			for i := range *fc {
+				if bytes.Equal((*fc)[i].key, req.Body) {
+					return (*fc)[i].resp
+				}
+			}
 		}
 	}
 
@@ -395,17 +422,11 @@ func (s *EpollServer) handleUploadPackV2(req *Request, repo *Repo, pkts []pktIte
 		body = append(body, pktFlush...)
 
 		if req.KeepAlive {
-			resp := buildImmutableHTTPResp(200, "application/x-git-upload-pack-result", body)
-			if repo.cachedFetchGen != repo.RefGen {
-				clear(repo.cachedFetch)
-				repo.cachedFetchGen = repo.RefGen
-			}
-			if len(repo.cachedFetch) < 32 {
-				repo.cachedFetch[string(req.Body)] = resp
-			}
+			resp := buildImmutableGitResp(200, "application/x-git-upload-pack-result", body)
+			repo.putFetchCache(req.Body, resp)
 			return resp
 		}
-		return s.buildResp(200, "application/x-git-upload-pack-result", body, nil, false)
+		return s.buildGitResp(200, "application/x-git-upload-pack-result", body, false)
 
 	case "fetch":
 		var wants, haves, clientShallows []OID
@@ -449,17 +470,11 @@ func (s *EpollServer) handleUploadPackV2(req *Request, repo *Repo, pkts []pktIte
 		body = append(body, pktFlush...)
 
 		if req.KeepAlive {
-			resp := buildImmutableHTTPResp(200, "application/x-git-upload-pack-result", body)
-			if repo.cachedFetchGen != repo.RefGen {
-				clear(repo.cachedFetch)
-				repo.cachedFetchGen = repo.RefGen
-			}
-			if len(repo.cachedFetch) < 32 {
-				repo.cachedFetch[string(req.Body)] = resp
-			}
+			resp := buildImmutableGitResp(200, "application/x-git-upload-pack-result", body)
+			repo.putFetchCache(req.Body, resp)
 			return resp
 		}
-		return s.buildResp(200, "application/x-git-upload-pack-result", body, nil, false)
+		return s.buildGitResp(200, "application/x-git-upload-pack-result", body, false)
 
 	default:
 		return s.buildJSONResp(400, "{\"message\":\"unknown v2 command\"}\n", nil, req.KeepAlive)
@@ -580,7 +595,7 @@ func collectReachableWithStop(repo *Repo, roots []OID, stopCommits map[OID]struc
 			parseCommitInto(obj)
 			collectTreeAndBlobs(repo, obj.TreeOID, seen, nil, nil)
 			if _, stop := stopCommits[cur]; !stop {
-				queue = append(queue, obj.Parents...)
+				queue = obj.AppendParents(queue)
 			}
 		case ObjTree:
 			for _, e := range ParseTree(obj.Data) {
@@ -628,7 +643,7 @@ func collectFetchObjects(repo *Repo, wants, haves, clientShallows []OID, depth i
 			case ObjCommit:
 				parseCommitInto(obj)
 				collectTreeAndBlobs(repo, obj.TreeOID, seen, exclude, &objs)
-				queue = append(queue, obj.Parents...)
+				queue = obj.AppendParents(queue)
 			case ObjTree:
 				for _, e := range ParseTree(obj.Data) {
 					if e.Mode == "40000" || e.Mode == "040000" {
@@ -696,10 +711,13 @@ func collectFetchObjects(repo *Repo, wants, haves, clientShallows []OID, depth i
 		collectTreeAndBlobs(repo, obj.TreeOID, seen, exclude, &objs)
 
 		if cur.level >= depth {
-			if len(obj.Parents) > 0 {
+			if obj.HasParents() {
 				newShallowSet[cur.oid] = struct{}{}
 			}
 			continue
+		}
+		if obj.HasParent0 {
+			q = append(q, item{oid: obj.Parent0, level: cur.level + 1})
 		}
 		for _, p := range obj.Parents {
 			q = append(q, item{oid: p, level: cur.level + 1})
@@ -731,7 +749,8 @@ func (s *EpollServer) handleGitReceivePack(req *Request, repo *Repo) []byte {
 		return s.buildJSONResp(400, "{\"message\":\"malformed receive-pack pkt-line\"}\n", nil, req.KeepAlive)
 	}
 
-	var cmds []pushCmd
+	var stackCmds [4]pushCmd
+	cmds := stackCmds[:0]
 	useSideband := false
 	for i, p := range pkts {
 		if p.kind != 0 {
@@ -756,15 +775,38 @@ func (s *EpollServer) handleGitReceivePack(req *Request, repo *Repo) []byte {
 		if !ok1 || !ok2 {
 			return s.buildJSONResp(400, "{\"message\":\"invalid oid in command\"}\n", nil, req.KeepAlive)
 		}
+		refBytes := line[82:]
+		refStr := "refs/heads/main"
+		if string(refBytes) != "refs/heads/main" {
+			refStr = string(refBytes)
+		}
 		cmds = append(cmds, pushCmd{
 			oldOID: oldOID,
 			newOID: newOID,
-			ref:    string(line[82:]),
+			ref:    refStr,
 		})
 	}
 
 	packBytes := req.Body[packOff:]
 	unpackErr := s.store.UnpackPackfile(repo, packBytes)
+
+	// Ultra-fast zero-alloc path for single fast-forward update on refs/heads/main (bench.push).
+	if unpackErr == nil && len(cmds) == 1 && cmds[0].ref == "refs/heads/main" && cmds[0].newOID != ZeroOID {
+		cmd := cmds[0]
+		if _, existsObj := repo.Objects[cmd.newOID]; existsObj {
+			cur, exists := repo.Refs["refs/heads/main"]
+			if exists && cur == cmd.oldOID && IsAncestor(repo, cur, cmd.newOID) {
+				repo.Refs["refs/heads/main"] = cmd.newOID
+				repo.PatchSingleRefCache("refs/heads/main", cmd.newOID)
+				if req.KeepAlive {
+					if useSideband {
+						return staticPushMainSidebandResp
+					}
+					return staticPushMainPlainResp
+				}
+			}
+		}
+	}
 
 	report := s.store.reportBuf[:0]
 	if unpackErr != nil {
@@ -843,5 +885,5 @@ func (s *EpollServer) handleGitReceivePack(req *Request, repo *Repo) []byte {
 	} else {
 		body = report
 	}
-	return s.buildResp(200, "application/x-git-receive-pack-result", body, nil, req.KeepAlive)
+	return s.buildGitResp(200, "application/x-git-receive-pack-result", body, req.KeepAlive)
 }

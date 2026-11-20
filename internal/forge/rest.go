@@ -261,17 +261,21 @@ func (s *EpollServer) handleREST(req *Request) []byte {
 							}
 							is := repo.Issues[num-1]
 							if req.KeepAlive {
-								if is.cachedGetResp == nil {
+								cached := is.cachedGetResp.Load()
+								if cached == nil {
 									jb := appendIssueJSON(make([]byte, 0, 512), is, s.store.ViewerLogin, s.store.ViewerID)
 									jb = append(jb, '\n')
-									is.cachedGetResp = buildImmutableHTTPResp(200, "application/json", jb)
+									resp := buildImmutableRESTResp(200, "application/json", jb)
+									is.cachedGetResp.Store(&resp)
+									return resp
 								}
-								return is.cachedGetResp
+								return *cached
 							}
-							jb := appendIssueJSON(s.store.respScratch[:0], is, s.store.ViewerLogin, s.store.ViewerID)
+							jb := appendIssueJSON(req.Tmp[:0], is, s.store.ViewerLogin, s.store.ViewerID)
 							jb = append(jb, '\n')
-							s.store.respScratch = jb
-							return s.buildJSONBytesResp(200, jb, nil, false)
+							req.Tmp = jb
+							req.Out = appendHTTPResp(req.Out[:0], 200, "application/json", jb, nil, false, true)
+							return req.Out
 						}
 					}
 				}
@@ -283,10 +287,11 @@ func (s *EpollServer) handleREST(req *Request) []byte {
 					}
 					if title, body, ok := tryFastIssueCreate(req.Body); ok {
 						is, _ := s.store.CreateIssue(repo, title, body, nil)
-						jb := appendIssueJSON(s.store.respScratch[:0], is, s.store.ViewerLogin, s.store.ViewerID)
+						jb := appendIssueJSON(req.Tmp[:0], is, s.store.ViewerLogin, s.store.ViewerID)
 						jb = append(jb, '\n')
-						s.store.respScratch = jb
-						return s.buildJSONBytesResp(201, jb, nil, req.KeepAlive)
+						req.Tmp = jb
+						req.Out = appendHTTPResp(req.Out[:0], 201, "application/json", jb, nil, req.KeepAlive, true)
+						return req.Out
 					}
 					return s.handleCreateIssueSlow(req, repo)
 				}
@@ -905,7 +910,7 @@ func (s *EpollServer) handleListCommits(req *Request, repo *Repo) []byte {
 		}
 		parseCommitInto(obj)
 		commits = append(commits, obj)
-		q = append(q, obj.Parents...)
+		q = obj.AppendParents(q)
 	}
 	var b []byte
 	b = append(b, '[')
@@ -930,7 +935,8 @@ func (s *EpollServer) handleListCommits(req *Request, repo *Repo) []byte {
 		b = append(b, `,"date":`...)
 		b = appendJSONString(b, s.store.TrialNow)
 		b = append(b, `}},"parents":[`...)
-		for j, p := range c.Parents {
+		ps := c.AppendParents(nil)
+		for j, p := range ps {
 			if j > 0 {
 				b = append(b, ',')
 			}

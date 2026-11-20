@@ -37,14 +37,28 @@ func (s *Store) PutObject(r *Repo, typ ObjType, data []byte, preCompressed []byt
 		}
 		return existing
 	}
-	cp := make([]byte, len(data))
+	cp := r.allocData(len(data))
 	copy(cp, data)
-	obj := &GitObj{
-		Type:    typ,
-		OID:     oid,
-		Data:    cp,
-		ZlibRaw: preCompressed,
+	return s.putObjectAllocated(r, oid, typ, cp, preCompressed)
+}
+
+func (s *Store) PutObjectOwned(r *Repo, typ ObjType, ownedData []byte, preCompressed []byte) *GitObj {
+	oid := s.HashGitObject(typ, ownedData)
+	if existing, ok := r.Objects[oid]; ok {
+		if len(existing.ZlibRaw) == 0 && len(preCompressed) > 0 {
+			existing.ZlibRaw = preCompressed
+		}
+		return existing
 	}
+	return s.putObjectAllocated(r, oid, typ, ownedData, preCompressed)
+}
+
+func (s *Store) putObjectAllocated(r *Repo, oid OID, typ ObjType, data []byte, preCompressed []byte) *GitObj {
+	obj := r.allocObj()
+	obj.Type = typ
+	obj.OID = oid
+	obj.Data = data
+	obj.ZlibRaw = preCompressed
 	if typ == ObjCommit {
 		parseCommitInto(obj)
 	} else if typ == ObjTag {
@@ -81,7 +95,12 @@ func parseCommitInto(obj *GitObj) {
 			}
 		} else if len(line) == 47 && line[0] == 'p' && line[6] == ' ' && string(line[:7]) == "parent " {
 			if oid, ok := ParseOIDBytes(line[7:]); ok {
-				obj.Parents = append(obj.Parents, oid)
+				if !obj.HasParent0 {
+					obj.Parent0 = oid
+					obj.HasParent0 = true
+				} else {
+					obj.Parents = append(obj.Parents, oid)
+				}
 			}
 		}
 	}
@@ -328,11 +347,11 @@ func IsAncestor(r *Repo, oldOID, newOID OID) bool {
 		return false
 	}
 	parseCommitInto(obj)
-	if len(obj.Parents) == 1 && obj.Parents[0] == oldOID {
+	if obj.HasParent0 && obj.Parent0 == oldOID {
 		return true
 	}
 	visited := make(map[OID]struct{}, 16)
-	queue := append([]OID(nil), obj.Parents...)
+	queue := obj.AppendParents(nil)
 	for len(queue) > 0 {
 		cur := queue[0]
 		queue = queue[1:]
@@ -348,7 +367,7 @@ func IsAncestor(r *Repo, oldOID, newOID OID) bool {
 			continue
 		}
 		parseCommitInto(cobj)
-		queue = append(queue, cobj.Parents...)
+		queue = cobj.AppendParents(queue)
 	}
 	return false
 }
@@ -369,7 +388,7 @@ func FindMergeBase(r *Repo, a, b OID) OID {
 			continue
 		}
 		parseCommitInto(obj)
-		q = append(q, obj.Parents...)
+		q = obj.AppendParents(q)
 	}
 	visitedB := make(map[OID]struct{}, 16)
 	qb := []OID{b}
@@ -388,7 +407,7 @@ func FindMergeBase(r *Repo, a, b OID) OID {
 			continue
 		}
 		parseCommitInto(obj)
-		qb = append(qb, obj.Parents...)
+		qb = obj.AppendParents(qb)
 	}
 	return ZeroOID
 }
@@ -732,23 +751,26 @@ func (s *Store) UnpackPackfile(r *Repo, pack []byte) error {
 		if err != nil {
 			return fmt.Errorf("zlib init: %w", err)
 		}
-		s.inflateBuf.Reset()
+
+		var objData []byte
 		if size > 0 {
-			s.inflateBuf.Grow(size)
+			objData = r.allocData(size)
+			if _, err := io.ReadFull(s.zReader, objData); err != nil {
+				return fmt.Errorf("zlib inflate: %w", err)
+			}
 		}
-		if _, err := io.Copy(&s.inflateBuf, s.zReader); err != nil {
-			return fmt.Errorf("zlib inflate: %w", err)
+		var eofProbe [1]byte
+		if n, err := s.zReader.Read(eofProbe[:]); n != 0 || err != io.EOF {
+			if err == nil {
+				return fmt.Errorf("inflated size mismatch: exceeded declared %d", size)
+			}
+			return fmt.Errorf("zlib trailer: %w", err)
 		}
 		pos = br.pos
-		inflated := s.inflateBuf.Bytes()
-		if len(inflated) != size {
-			return fmt.Errorf("inflated size mismatch: got %d want %d", len(inflated), size)
-		}
 
-		// Fast path: non-delta object — store immediately without copying compressed bytes
-		// (ZlibRaw is populated lazily on fetch/clone so push pays zero extra copies).
+		// Fast path: non-delta object — store directly with zero extra copy.
 		if !hasDeltas && typ >= ObjCommit && typ <= ObjTag {
-			obj := s.PutObject(r, typ, inflated, nil)
+			obj := s.PutObjectOwned(r, typ, objData, nil)
 			entries[i] = rawPackEntry{
 				offset:   entryOff,
 				typ:      typ,
@@ -758,15 +780,13 @@ func (s *Store) UnpackPackfile(r *Repo, pack []byte) error {
 			continue
 		}
 
-		dataCopy := make([]byte, len(inflated))
-		copy(dataCopy, inflated)
 		entries[i] = rawPackEntry{
 			offset:     entryOff,
 			typ:        typ,
 			size:       size,
 			baseOffset: baseOff,
 			baseOID:    baseOID,
-			data:       dataCopy,
+			data:       objData,
 		}
 	}
 

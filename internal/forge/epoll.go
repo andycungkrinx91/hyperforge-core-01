@@ -2,20 +2,22 @@ package forge
 
 import (
 	"bytes"
-	"encoding/hex"
+	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/url"
-	"runtime"
 	"strconv"
+	"sync"
 	"sync/atomic"
-	"syscall"
-	"unsafe"
 )
 
 const (
-	tcpQuickack = 12 // Linux TCP_QUICKACK
-	initReadCap = 16384
-	maxReqSize  = 64 << 20 // 64 MiB safety cap
+	initReadCap    = 16384
+	initWriteCap   = 8192
+	maxPoolRetain  = 65536
+	maxReqSize     = 64 << 20 // 64 MiB safety cap
 )
 
 // Request represents a parsed HTTP/1.1 request using slices directly into the connection read buffer.
@@ -30,6 +32,10 @@ type Request struct {
 	ContentType []byte
 	Body        []byte
 	KeepAlive   bool
+
+	// Per-connection reusable output/scratch buffers (owned by the connection goroutine).
+	Out []byte
+	Tmp []byte
 }
 
 func (r *Request) QueryParam(key string) string {
@@ -58,76 +64,51 @@ func (r *Request) QueryParam(key string) string {
 	return ""
 }
 
-type connState struct {
-	fd         int
-	rbuf       []byte
-	rpos       int
-	rlen       int
-	wbuf       []byte
-	wpos       int
-	wantOut    bool
-	closeAfter bool
-	sent100    bool
+type connScratch struct {
+	rbuf []byte
+	wbuf []byte
+	tmp  []byte
 }
 
+var connScratchPool = sync.Pool{
+	New: func() any {
+		return &connScratch{
+			rbuf: make([]byte, initReadCap),
+			wbuf: make([]byte, 0, initWriteCap),
+			tmp:  make([]byte, 0, 2048),
+		}
+	},
+}
+
+type lastReadCache struct {
+	path      []byte
+	resp      []byte
+	issue     *Issue
+	repoEpoch uint64
+}
+
+// EpollServer is a multi-goroutine raw TCP HTTP/1.1 server powered by Go's runtime netpoller
+// with lock-free atomic hot paths across both container CPUs.
 type EpollServer struct {
 	store    *Store
-	listenFD int
-	epFD     int
+	ln       net.Listener
 	port     int
 	closed   atomic.Bool
-	conns    map[int]*connState
-	scratch  []byte // reusable per-request response scratch buffer (single-threaded)
+	lastRead atomic.Pointer[lastReadCache]
 }
 
 func NewEpollServer(store *Store, bindPort int) (*EpollServer, error) {
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, 0)
+	lc := net.ListenConfig{KeepAlive: -1}
+	addr := fmt.Sprintf("0.0.0.0:%d", bindPort)
+	ln, err := lc.Listen(context.Background(), "tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("socket: %w", err)
+		return nil, fmt.Errorf("listen %s: %w", addr, err)
 	}
-	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
-	_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
-
-	sa := &syscall.SockaddrInet4{Port: bindPort}
-	if err := syscall.Bind(fd, sa); err != nil {
-		_ = syscall.Close(fd)
-		return nil, fmt.Errorf("bind: %w", err)
-	}
-	if err := syscall.Listen(fd, 1024); err != nil {
-		_ = syscall.Close(fd)
-		return nil, fmt.Errorf("listen: %w", err)
-	}
-
-	sockname, err := syscall.Getsockname(fd)
-	if err != nil {
-		_ = syscall.Close(fd)
-		return nil, fmt.Errorf("getsockname: %w", err)
-	}
-	actualPort := sockname.(*syscall.SockaddrInet4).Port
-
-	epFD, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
-	if err != nil {
-		_ = syscall.Close(fd)
-		return nil, fmt.Errorf("epoll_create1: %w", err)
-	}
-
-	ev := syscall.EpollEvent{
-		Events: syscall.EPOLLIN,
-		Fd:     int32(fd),
-	}
-	if err := syscall.EpollCtl(epFD, syscall.EPOLL_CTL_ADD, fd, &ev); err != nil {
-		_ = syscall.Close(epFD)
-		_ = syscall.Close(fd)
-		return nil, fmt.Errorf("epoll_ctl listen: %w", err)
-	}
-
+	actualPort := ln.Addr().(*net.TCPAddr).Port
 	return &EpollServer{
-		store:    store,
-		listenFD: fd,
-		epFD:     epFD,
-		port:     actualPort,
-		conns:    make(map[int]*connState, 128),
-		scratch:  make([]byte, 0, 32768),
+		store: store,
+		ln:    ln,
+		port:  actualPort,
 	}, nil
 }
 
@@ -139,418 +120,302 @@ func (s *EpollServer) Close() {
 	if s.closed.Swap(true) {
 		return
 	}
-	_ = syscall.Close(s.listenFD)
-	_ = syscall.Close(s.epFD)
+	if s.ln != nil {
+		_ = s.ln.Close()
+	}
 }
 
 func (s *EpollServer) Serve() error {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	events := make([]syscall.EpollEvent, 64)
-	for !s.closed.Load() {
-		n, err := syscall.EpollWait(s.epFD, events, -1)
+	for {
+		conn, err := s.ln.Accept()
 		if err != nil {
-			if err == syscall.EINTR {
-				continue
-			}
-			if s.closed.Load() {
+			if s.closed.Load() || errors.Is(err, net.ErrClosed) {
 				return nil
+			}
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				continue
 			}
 			return err
 		}
-		for i := 0; i < n; i++ {
-			ev := events[i]
-			fd := int(ev.Fd)
-			if fd == s.listenFD {
-				s.acceptAll()
-				continue
-			}
-			c, ok := s.conns[fd]
-			if !ok {
-				continue
-			}
-			if ev.Events&(syscall.EPOLLERR|syscall.EPOLLHUP) != 0 {
-				if ev.Events&syscall.EPOLLIN != 0 {
-					s.handleRead(c)
-				}
-				if _, still := s.conns[fd]; still {
-					s.closeConn(c)
-				}
-				continue
-			}
-			if ev.Events&syscall.EPOLLOUT != 0 {
-				s.handleWrite(c)
-				if _, still := s.conns[fd]; !still {
-					continue
-				}
-			}
-			if ev.Events&syscall.EPOLLIN != 0 {
-				s.handleRead(c)
-			}
+		go s.serveConn(conn)
+	}
+}
+
+var (
+	crlf2              = []byte("\r\n\r\n")
+	dotGitSlash        = []byte(".git/")
+	continue100        = []byte("HTTP/1.1 100 Continue\r\n\r\n")
+	staticHealthzHTTP  = buildImmutableRESTResp(200, "application/json", []byte("{\"ok\":true}\n"))
+	staticBadReqClose  = []byte("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: 26\r\nConnection: close\r\n\r\n{\"message\":\"Bad Request\"}\n")
+	staticUnauthKeep   = buildImmutableRESTResp(401, "application/json", []byte("{\"message\":\"Requires authentication\"}\n"))
+	staticNotFoundKeep = buildImmutableRESTResp(404, "application/json", []byte("{\"message\":\"Not Found\"}\n"))
+)
+
+func writeAll(conn net.Conn, data []byte) error {
+	for len(data) > 0 {
+		n, err := conn.Write(data)
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func (s *EpollServer) acceptAll() {
+func (s *EpollServer) serveConn(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+
+	sc := connScratchPool.Get().(*connScratch)
+	defer func() {
+		if cap(sc.rbuf) > maxPoolRetain {
+			sc.rbuf = make([]byte, initReadCap)
+		}
+		if cap(sc.wbuf) > maxPoolRetain {
+			sc.wbuf = make([]byte, 0, initWriteCap)
+		}
+		if cap(sc.tmp) > maxPoolRetain {
+			sc.tmp = make([]byte, 0, 2048)
+		}
+		connScratchPool.Put(sc)
+	}()
+
+	rbuf := sc.rbuf
+	rpos := 0
+	rlen := 0
+	sent100 := false
+	var req Request
+
 	for {
-		nfd, _, err := syscall.Accept4(s.listenFD, syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC)
-		if err != nil {
-			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK || err == syscall.EINTR {
+		// Parse and dispatch all complete HTTP/1.1 requests already buffered.
+		for rpos < rlen {
+			avail := rbuf[rpos:rlen]
+			hdrEnd := bytes.Index(avail, crlf2)
+			if hdrEnd < 0 {
+				break
+			}
+			hdrBytes := avail[:hdrEnd]
+			bodyStart := hdrEnd + 4
+
+			lineEnd := bytes.IndexByte(hdrBytes, '\r')
+			if lineEnd < 0 {
+				_ = writeAll(conn, staticBadReqClose)
 				return
 			}
-			return
-		}
-		_ = syscall.SetsockoptInt(nfd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
-		ev := syscall.EpollEvent{
-			Events: syscall.EPOLLIN,
-			Fd:     int32(nfd),
-		}
-		if err := syscall.EpollCtl(s.epFD, syscall.EPOLL_CTL_ADD, nfd, &ev); err != nil {
-			_ = syscall.Close(nfd)
-			continue
-		}
-		s.conns[nfd] = &connState{
-			fd:   nfd,
-			rbuf: make([]byte, initReadCap),
-		}
-	}
-}
-
-func (s *EpollServer) closeConn(c *connState) {
-	delete(s.conns, c.fd)
-	_ = syscall.EpollCtl(s.epFD, syscall.EPOLL_CTL_DEL, c.fd, nil)
-	_ = syscall.Close(c.fd)
-}
-
-func (s *EpollServer) setEpollOut(c *connState, want bool) {
-	if c.wantOut == want {
-		return
-	}
-	c.wantOut = want
-	mask := uint32(syscall.EPOLLIN)
-	if want {
-		mask |= syscall.EPOLLOUT
-	}
-	ev := syscall.EpollEvent{Events: mask, Fd: int32(c.fd)}
-	_ = syscall.EpollCtl(s.epFD, syscall.EPOLL_CTL_MOD, c.fd, &ev)
-}
-
-func (s *EpollServer) handleWrite(c *connState) {
-	for c.wpos < len(c.wbuf) {
-		n, err := syscall.Write(c.fd, c.wbuf[c.wpos:])
-		if n > 0 {
-			c.wpos += n
-		}
-		if err != nil {
-			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
-				s.setEpollOut(c, true)
+			reqLine := hdrBytes[:lineEnd]
+			sp1 := bytes.IndexByte(reqLine, ' ')
+			if sp1 <= 0 {
+				_ = writeAll(conn, staticBadReqClose)
 				return
 			}
-			if err == syscall.EINTR {
-				continue
+			method := reqLine[:sp1]
+			rest := reqLine[sp1+1:]
+			sp2 := bytes.IndexByte(rest, ' ')
+			if sp2 <= 0 {
+				_ = writeAll(conn, staticBadReqClose)
+				return
 			}
-			s.closeConn(c)
-			return
-		}
-	}
-	c.wbuf = c.wbuf[:0]
-	c.wpos = 0
-	s.setEpollOut(c, false)
-	if c.closeAfter {
-		s.closeConn(c)
-	}
-}
+			rawTarget := rest[:sp2]
+			proto := rest[sp2+1:]
 
-func (s *EpollServer) writeResponse(c *connState, resp []byte, closeConn bool) {
-	if closeConn {
-		c.closeAfter = true
-	}
-	if len(c.wbuf) == 0 {
-		off := 0
-		for off < len(resp) {
-			n, err := syscall.Write(c.fd, resp[off:])
-			if n > 0 {
-				off += n
+			keepAlive := true
+			if len(proto) >= 8 && proto[7] == '0' {
+				keepAlive = false
 			}
-			if err != nil {
-				if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
-					c.wbuf = append(c.wbuf[:0], resp[off:]...)
-					c.wpos = 0
-					s.setEpollOut(c, true)
-					return
+
+			var host, auth, gitProto, contentType []byte
+			contentLen := 0
+			hasContentLen := false
+			chunked := false
+			expect100 := false
+
+			pos := lineEnd + 2
+			for pos < len(hdrBytes) {
+				nl := bytes.IndexByte(hdrBytes[pos:], '\r')
+				var line []byte
+				if nl < 0 {
+					line = hdrBytes[pos:]
+					pos = len(hdrBytes)
+				} else {
+					line = hdrBytes[pos : pos+nl]
+					pos += nl + 2
 				}
-				if err == syscall.EINTR {
+				colon := bytes.IndexByte(line, ':')
+				if colon <= 0 {
 					continue
 				}
-				s.closeConn(c)
+				name := line[:colon]
+				val := trimASCIISpace(line[colon+1:])
+				switch len(name) {
+				case 4:
+					if eqFoldASCII(name, "host") {
+						host = val
+					}
+				case 6:
+					if eqFoldASCII(name, "expect") && eqFoldASCII(val, "100-continue") {
+						expect100 = true
+					}
+				case 10:
+					if eqFoldASCII(name, "connection") {
+						if eqFoldASCII(val, "close") {
+							keepAlive = false
+						} else if eqFoldASCII(val, "keep-alive") {
+							keepAlive = true
+						}
+					}
+				case 12:
+					if eqFoldASCII(name, "content-type") {
+						contentType = val
+					} else if eqFoldASCII(name, "git-protocol") {
+						gitProto = val
+					}
+				case 13:
+					if eqFoldASCII(name, "authorization") {
+						auth = val
+					}
+				case 14:
+					if eqFoldASCII(name, "content-length") {
+						n, ok := parseUintASCII(val)
+						if !ok || n > maxReqSize {
+							_ = writeAll(conn, staticBadReqClose)
+							return
+						}
+						contentLen = n
+						hasContentLen = true
+					}
+				case 17:
+					if eqFoldASCII(name, "transfer-encoding") {
+						if containsFoldASCII(val, "chunked") {
+							chunked = true
+						}
+					}
+				}
+			}
+
+			if expect100 && !sent100 && len(avail)-bodyStart == 0 {
+				sent100 = true
+				if err := writeAll(conn, continue100); err != nil {
+					return
+				}
+			}
+
+			var body []byte
+			var totalConsumed int
+			if chunked {
+				decoded, consumed, done, bad := decodeChunked(avail[bodyStart:])
+				if bad {
+					_ = writeAll(conn, staticBadReqClose)
+					return
+				}
+				if !done {
+					break
+				}
+				body = decoded
+				totalConsumed = bodyStart + consumed
+			} else if hasContentLen {
+				if len(avail)-bodyStart < contentLen {
+					// Pre-grow read buffer to fit the full body in minimal reads.
+					needed := rpos + bodyStart + contentLen
+					if needed > len(rbuf) {
+						if rpos > 0 {
+							copy(rbuf, rbuf[rpos:rlen])
+							rlen -= rpos
+							rpos = 0
+							needed = bodyStart + contentLen
+						}
+						if needed > len(rbuf) {
+							newCap := len(rbuf) * 2
+							for newCap < needed {
+								newCap *= 2
+							}
+							if newCap > maxReqSize {
+								newCap = maxReqSize
+							}
+							nb := make([]byte, newCap)
+							copy(nb, rbuf[:rlen])
+							rbuf = nb
+							sc.rbuf = nb
+						}
+					}
+					break
+				}
+				body = avail[bodyStart : bodyStart+contentLen]
+				totalConsumed = bodyStart + contentLen
+			} else {
+				totalConsumed = bodyStart
+			}
+
+			path := rawTarget
+			var query []byte
+			if qidx := bytes.IndexByte(rawTarget, '?'); qidx >= 0 {
+				path = rawTarget[:qidx]
+				query = rawTarget[qidx+1:]
+			}
+
+			req = Request{
+				Method:      method,
+				RawTarget:   rawTarget,
+				Path:        path,
+				Query:       query,
+				Host:        host,
+				Auth:        auth,
+				GitProtocol: gitProto,
+				ContentType: contentType,
+				Body:        body,
+				KeepAlive:   keepAlive,
+				Out:         sc.wbuf[:0],
+				Tmp:         sc.tmp[:0],
+			}
+
+			resp := s.dispatch(&req)
+			sc.wbuf = req.Out
+			sc.tmp = req.Tmp
+
+			sent100 = false
+			rpos += totalConsumed
+			if rpos == rlen {
+				rpos = 0
+				rlen = 0
+			}
+
+			if err := writeAll(conn, resp); err != nil {
+				return
+			}
+			if !keepAlive {
 				return
 			}
 		}
-		if c.closeAfter {
-			s.closeConn(c)
-		}
-		return
-	}
-	c.wbuf = append(c.wbuf, resp...)
-	s.handleWrite(c)
-}
 
-func (s *EpollServer) handleRead(c *connState) {
-	for {
-		if c.rlen == len(c.rbuf) {
-			if c.rpos > 0 {
-				copy(c.rbuf, c.rbuf[c.rpos:c.rlen])
-				c.rlen -= c.rpos
-				c.rpos = 0
+		// Need more bytes from the socket.
+		if rlen == len(rbuf) {
+			if rpos > 0 {
+				copy(rbuf, rbuf[rpos:rlen])
+				rlen -= rpos
+				rpos = 0
 			} else {
-				newCap := len(c.rbuf) * 2
+				newCap := len(rbuf) * 2
 				if newCap > maxReqSize {
-					s.closeConn(c)
 					return
 				}
 				nb := make([]byte, newCap)
-				copy(nb, c.rbuf[:c.rlen])
-				c.rbuf = nb
+				copy(nb, rbuf[:rlen])
+				rbuf = nb
+				sc.rbuf = nb
 			}
 		}
-		availSpace := len(c.rbuf) - c.rlen
-		n, err := syscall.Read(c.fd, c.rbuf[c.rlen:])
+
+		n, err := conn.Read(rbuf[rlen:])
 		if n > 0 {
-			c.rlen += n
-			if !s.processBuffer(c) {
-				return
-			}
-			// If kernel returned less than buffer space and we consumed all complete
-			// requests (c.rlen == 0), return directly to epoll_wait to avoid a wasted
-			// EAGAIN read syscall on every sequential keep-alive request.
-			if n < availSpace && c.rlen == 0 {
-				return
-			}
-			continue
+			rlen += n
 		}
-		if n == 0 && err == nil {
-			s.closeConn(c)
-			return
-		}
-		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
-			return
-		}
-		if err == syscall.EINTR {
-			continue
-		}
-		s.closeConn(c)
-		return
-	}
-}
-
-var (
-	crlf2       = []byte("\r\n\r\n")
-	continue100 = []byte("HTTP/1.1 100 Continue\r\n\r\n")
-)
-
-// processBuffer parses and dispatches all complete HTTP/1.1 requests in c.rbuf.
-// Returns false if the connection was closed.
-func (s *EpollServer) processBuffer(c *connState) bool {
-	for {
-		avail := c.rbuf[c.rpos:c.rlen]
-		if len(avail) == 0 {
-			c.rpos = 0
-			c.rlen = 0
-			return true
-		}
-		hdrEnd := bytes.Index(avail, crlf2)
-		if hdrEnd < 0 {
-			return true
-		}
-		hdrBytes := avail[:hdrEnd]
-		bodyStart := hdrEnd + 4
-
-		// Parse request line: METHOD SP TARGET SP HTTP/1.x
-		lineEnd := bytes.IndexByte(hdrBytes, '\r')
-		if lineEnd < 0 {
-			s.writeResponse(c, s.buildJSONResp(400, `{"message":"Bad Request"}`+"\n", nil, false), true)
-			return false
-		}
-		reqLine := hdrBytes[:lineEnd]
-		sp1 := bytes.IndexByte(reqLine, ' ')
-		if sp1 <= 0 {
-			s.writeResponse(c, s.buildJSONResp(400, `{"message":"Bad Request"}`+"\n", nil, false), true)
-			return false
-		}
-		method := reqLine[:sp1]
-		rest := reqLine[sp1+1:]
-		sp2 := bytes.IndexByte(rest, ' ')
-		if sp2 <= 0 {
-			s.writeResponse(c, s.buildJSONResp(400, `{"message":"Bad Request"}`+"\n", nil, false), true)
-			return false
-		}
-		rawTarget := rest[:sp2]
-		proto := rest[sp2+1:]
-
-		keepAlive := true
-		if len(proto) >= 8 && proto[7] == '0' {
-			keepAlive = false
-		}
-
-		var host, auth, gitProto, contentType []byte
-		contentLen := 0
-		hasContentLen := false
-		chunked := false
-		expect100 := false
-
-		// Parse headers without allocating
-		pos := lineEnd + 2
-		for pos < len(hdrBytes) {
-			nl := bytes.IndexByte(hdrBytes[pos:], '\r')
-			var line []byte
-			if nl < 0 {
-				line = hdrBytes[pos:]
-				pos = len(hdrBytes)
-			} else {
-				line = hdrBytes[pos : pos+nl]
-				pos += nl + 2
-			}
-			colon := bytes.IndexByte(line, ':')
-			if colon <= 0 {
+		if err != nil {
+			if err == io.EOF && rpos < rlen {
+				// Process any remaining buffered request before closing.
 				continue
 			}
-			name := line[:colon]
-			val := trimASCIISpace(line[colon+1:])
-			switch len(name) {
-			case 4:
-				if eqFoldASCII(name, "host") {
-					host = val
-				}
-			case 6:
-				if eqFoldASCII(name, "expect") && eqFoldASCII(val, "100-continue") {
-					expect100 = true
-				}
-			case 10:
-				if eqFoldASCII(name, "connection") {
-					if eqFoldASCII(val, "close") {
-						keepAlive = false
-					} else if eqFoldASCII(val, "keep-alive") {
-						keepAlive = true
-					}
-				}
-			case 12:
-				if eqFoldASCII(name, "content-type") {
-					contentType = val
-				} else if eqFoldASCII(name, "git-protocol") {
-					gitProto = val
-				}
-			case 13:
-				if eqFoldASCII(name, "authorization") {
-					auth = val
-				}
-			case 14:
-				if eqFoldASCII(name, "content-length") {
-					n, ok := parseUintASCII(val)
-					if !ok || n > maxReqSize {
-						s.writeResponse(c, s.buildJSONResp(400, `{"message":"Invalid Content-Length"}`+"\n", nil, false), true)
-						return false
-					}
-					contentLen = n
-					hasContentLen = true
-				}
-			case 17:
-				if eqFoldASCII(name, "transfer-encoding") {
-					if containsFoldASCII(val, "chunked") {
-						chunked = true
-					}
-				}
-			}
-		}
-
-		if expect100 && !c.sent100 && len(avail)-bodyStart == 0 {
-			c.sent100 = true
-			s.writeResponse(c, continue100, false)
-			if _, still := s.conns[c.fd]; !still {
-				return false
-			}
-		}
-
-		var body []byte
-		var totalConsumed int
-		if chunked {
-			decoded, consumed, done, bad := decodeChunked(avail[bodyStart:])
-			if bad {
-				s.writeResponse(c, s.buildJSONResp(400, `{"message":"Bad chunked encoding"}`+"\n", nil, false), true)
-				return false
-			}
-			if !done {
-				return true
-			}
-			body = decoded
-			totalConsumed = bodyStart + consumed
-		} else if hasContentLen {
-			if len(avail)-bodyStart < contentLen {
-				// Grow buffer upfront to fit the whole body in minimal reads
-				needed := c.rpos + bodyStart + contentLen
-				if needed > len(c.rbuf) {
-					if c.rpos > 0 {
-						copy(c.rbuf, c.rbuf[c.rpos:c.rlen])
-						c.rlen -= c.rpos
-						c.rpos = 0
-						needed = bodyStart + contentLen
-					}
-					if needed > len(c.rbuf) {
-						newCap := len(c.rbuf) * 2
-						for newCap < needed {
-							newCap *= 2
-						}
-						if newCap > maxReqSize {
-							newCap = maxReqSize
-						}
-						nb := make([]byte, newCap)
-						copy(nb, c.rbuf[:c.rlen])
-						c.rbuf = nb
-					}
-				}
-				return true
-			}
-			body = avail[bodyStart : bodyStart+contentLen]
-			totalConsumed = bodyStart + contentLen
-		} else {
-			totalConsumed = bodyStart
-		}
-
-		path := rawTarget
-		var query []byte
-		if qidx := bytes.IndexByte(rawTarget, '?'); qidx >= 0 {
-			path = rawTarget[:qidx]
-			query = rawTarget[qidx+1:]
-		}
-
-		req := Request{
-			Method:      method,
-			RawTarget:   rawTarget,
-			Path:        path,
-			Query:       query,
-			Host:        host,
-			Auth:        auth,
-			GitProtocol: gitProto,
-			ContentType: contentType,
-			Body:        body,
-			KeepAlive:   keepAlive,
-		}
-
-		resp := s.dispatch(&req)
-		c.sent100 = false
-		c.rpos += totalConsumed
-		if c.rpos == c.rlen {
-			c.rpos = 0
-			c.rlen = 0
-		}
-
-		s.writeResponse(c, resp, !keepAlive)
-		if !keepAlive {
-			return false
-		}
-		if _, still := s.conns[c.fd]; !still {
-			return false
+			return
 		}
 	}
 }
@@ -574,7 +439,6 @@ func decodeChunked(src []byte) (out []byte, consumed int, complete bool, bad boo
 		}
 		pos += nl + 2
 		if sz == 0 {
-			// Consume trailer lines ending with CRLF
 			for {
 				tnl := bytes.Index(src[pos:], []byte("\r\n"))
 				if tnl < 0 {
@@ -655,10 +519,6 @@ func parseUintASCII(b []byte) (int, bool) {
 	return n, true
 }
 
-func b2s(b []byte) string {
-	return unsafe.String(unsafe.SliceData(b), len(b))
-}
-
 func statusText(code int) string {
 	switch code {
 	case 200:
@@ -686,47 +546,38 @@ func statusText(code int) string {
 	}
 }
 
-func (s *EpollServer) nextReqID(dst []byte) []byte {
-	s.store.ReqSeq++
-	var raw [8]byte
-	v := s.store.ReqSeq
-	raw[0] = byte(v >> 56)
-	raw[1] = byte(v >> 48)
-	raw[2] = byte(v >> 40)
-	raw[3] = byte(v >> 32)
-	raw[4] = byte(v >> 24)
-	raw[5] = byte(v >> 16)
-	raw[6] = byte(v >> 8)
-	raw[7] = byte(v)
-	var enc [16]byte
-	hex.Encode(enc[:], raw[:])
-	return append(dst, enc[:]...)
+func appendHTTPResp(dst []byte, status int, contentType string, body []byte, extraHeaders [][2]string, keepAlive bool, includeReqID bool) []byte {
+	dst = append(dst, "HTTP/1.1 "...)
+	dst = append(dst, statusText(status)...)
+	dst = append(dst, "\r\nContent-Type: "...)
+	dst = append(dst, contentType...)
+	if includeReqID {
+		dst = append(dst, "\r\nX-GitHub-Request-Id: 1"...)
+	}
+	for _, h := range extraHeaders {
+		dst = append(dst, "\r\n"...)
+		dst = append(dst, h[0]...)
+		dst = append(dst, ": "...)
+		dst = append(dst, h[1]...)
+	}
+	dst = append(dst, "\r\nContent-Length: "...)
+	dst = strconv.AppendInt(dst, int64(len(body)), 10)
+	if !keepAlive {
+		dst = append(dst, "\r\nConnection: close\r\n\r\n"...)
+	} else {
+		dst = append(dst, "\r\n\r\n"...)
+	}
+	return append(dst, body...)
 }
 
 func (s *EpollServer) buildResp(status int, contentType string, body []byte, extraHeaders [][2]string, keepAlive bool) []byte {
-	buf := s.scratch[:0]
-	buf = append(buf, "HTTP/1.1 "...)
-	buf = append(buf, statusText(status)...)
-	buf = append(buf, "\r\nContent-Type: "...)
-	buf = append(buf, contentType...)
-	buf = append(buf, "\r\nX-GitHub-Request-Id: "...)
-	buf = s.nextReqID(buf)
-	for _, h := range extraHeaders {
-		buf = append(buf, "\r\n"...)
-		buf = append(buf, h[0]...)
-		buf = append(buf, ": "...)
-		buf = append(buf, h[1]...)
-	}
-	buf = append(buf, "\r\nContent-Length: "...)
-	buf = strconv.AppendInt(buf, int64(len(body)), 10)
-	if keepAlive {
-		buf = append(buf, "\r\nConnection: keep-alive\r\n\r\n"...)
-	} else {
-		buf = append(buf, "\r\nConnection: close\r\n\r\n"...)
-	}
-	buf = append(buf, body...)
-	s.scratch = buf
-	return buf
+	buf := make([]byte, 0, len(body)+128)
+	return appendHTTPResp(buf, status, contentType, body, extraHeaders, keepAlive, true)
+}
+
+func (s *EpollServer) buildGitResp(status int, contentType string, body []byte, keepAlive bool) []byte {
+	buf := make([]byte, 0, len(body)+96)
+	return appendHTTPResp(buf, status, contentType, body, nil, keepAlive, false)
 }
 
 func (s *EpollServer) buildJSONResp(status int, body string, extraHeaders [][2]string, keepAlive bool) []byte {
@@ -737,23 +588,134 @@ func (s *EpollServer) buildJSONBytesResp(status int, body []byte, extraHeaders [
 	return s.buildResp(status, "application/json", body, extraHeaders, keepAlive)
 }
 
-func buildImmutableHTTPResp(status int, contentType string, body []byte) []byte {
-	out := make([]byte, 0, len(body)+144)
-	out = append(out, "HTTP/1.1 "...)
-	out = append(out, statusText(status)...)
-	out = append(out, "\r\nContent-Type: "...)
-	out = append(out, contentType...)
-	out = append(out, "\r\nX-GitHub-Request-Id: 1\r\nContent-Length: "...)
-	out = strconv.AppendInt(out, int64(len(body)), 10)
-	out = append(out, "\r\nConnection: keep-alive\r\n\r\n"...)
-	out = append(out, body...)
-	return out
+func buildImmutableRESTResp(status int, contentType string, body []byte) []byte {
+	out := make([]byte, 0, len(body)+128)
+	return appendHTTPResp(out, status, contentType, body, nil, true, true)
+}
+
+func buildImmutableGitResp(status int, contentType string, body []byte) []byte {
+	out := make([]byte, 0, len(body)+96)
+	return appendHTTPResp(out, status, contentType, body, nil, true, false)
+}
+
+// dispatchFast handles the hot read/clone/push-adv endpoints completely lock-free.
+// Returns nil on cache miss or non-fast-path requests.
+func (s *EpollServer) dispatchFast(req *Request) []byte {
+	if !req.KeepAlive {
+		return nil
+	}
+	p := req.Path
+	m := req.Method
+
+	// Fast path 1: GET /api/v3/repos/{owner}/{repo}/issues/{n} (bench.read)
+	if len(m) == 3 && m[0] == 'G' && len(p) > 22 && string(p[:14]) == "/api/v3/repos/" {
+		if !s.store.CheckAuth(req.Auth) {
+			return staticUnauthKeep
+		}
+		if lr := s.lastRead.Load(); lr != nil && lr.repoEpoch == s.store.repoEpoch.Load() && bytes.Equal(p, lr.path) {
+			if lr.issue.cachedGetResp.Load() != nil {
+				return lr.resp
+			}
+		}
+		rest := p[14:]
+		if s1 := bytes.IndexByte(rest, '/'); s1 > 0 {
+			owner := rest[:s1]
+			afterOwner := rest[s1+1:]
+			if s2 := bytes.IndexByte(afterOwner, '/'); s2 > 0 {
+				repoName := afterOwner[:s2]
+				tail := afterOwner[s2:]
+				if len(tail) > 8 && string(tail[:8]) == "/issues/" {
+					numPart := tail[8:]
+					if bytes.IndexByte(numPart, '/') < 0 {
+						if num, ok := parseUintASCII(numPart); ok && num > 0 {
+							repo := s.store.GetRepoLockFree(owner, repoName)
+							if repo == nil {
+								return staticNotFoundKeep
+							}
+							if snap := repo.issuesSnap.Load(); snap != nil && num <= len(*snap) {
+								is := (*snap)[num-1]
+								if cached := is.cachedGetResp.Load(); cached != nil {
+									pathCopy := make([]byte, len(p))
+									copy(pathCopy, p)
+									s.lastRead.Store(&lastReadCache{
+										path:      pathCopy,
+										resp:      *cached,
+										issue:     is,
+										repoEpoch: s.store.repoEpoch.Load(),
+									})
+									return *cached
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		return nil
+	}
+
+	// Fast path 2: /healthz
+	if len(p) == 8 && string(p) == "/healthz" && len(m) == 3 && m[0] == 'G' {
+		return staticHealthzHTTP
+	}
+
+	// Fast path 3: Git Smart HTTP /{owner}/{repo}.git/... (bench.clone & bench.push GET)
+	if dotGit := bytes.Index(p, dotGitSlash); dotGit > 2 {
+		rest := p[1:dotGit]
+		if slash1 := bytes.IndexByte(rest, '/'); slash1 > 0 {
+			if !s.store.CheckAuth(req.Auth) {
+				return staticUnauthKeep
+			}
+			owner := rest[:slash1]
+			repoName := rest[slash1+1:]
+			subPath := p[dotGit+5:]
+			repo := s.store.GetRepoLockFree(owner, repoName)
+			if repo == nil {
+				return staticNotFoundKeep
+			}
+			if len(m) == 3 && m[0] == 'G' && string(subPath) == "info/refs" {
+				if bytes.Equal(req.Query, qUploadPack) {
+					if bytes.Contains(req.GitProtocol, v2ProtoBytes) {
+						return staticUploadV2HTTP
+					}
+					if cached := repo.upV0Cache.Load(); cached != nil {
+						return *cached
+					}
+				} else if bytes.Equal(req.Query, qReceivePack) {
+					if cached := repo.recvCache.Load(); cached != nil {
+						return *cached
+					}
+				}
+				return nil
+			}
+			if len(m) == 4 && m[0] == 'P' && string(subPath) == "git-upload-pack" {
+				if bytes.Contains(req.GitProtocol, v2ProtoBytes) {
+					if fc := repo.fetchCache.Load(); fc != nil {
+						entries := *fc
+						for i := range entries {
+							if bytes.Equal(entries[i].key, req.Body) {
+								return entries[i].resp
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // dispatch routes every request across /healthz, /api/v3, /api/graphql, /mcp, and /{owner}/{repo}.git/*.
 func (s *EpollServer) dispatch(req *Request) []byte {
+	if resp := s.dispatchFast(req); resp != nil {
+		return resp
+	}
+
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+
 	p := req.Path
-	// Fast path 1: REST API (/api/v3...) and GraphQL (/api/graphql)
+	// REST API (/api/v3...) and GraphQL (/api/graphql)
 	if len(p) >= 7 && p[0] == '/' && p[1] == 'a' && p[2] == 'p' && p[3] == 'i' && p[4] == '/' {
 		if p[5] == 'v' && p[6] == '3' && (len(p) == 7 || p[7] == '/') {
 			return s.handleREST(req)
@@ -762,18 +724,18 @@ func (s *EpollServer) dispatch(req *Request) []byte {
 			return s.handleGraphQL(req)
 		}
 	}
-	// Fast path 2: /healthz (no auth required)
+	// /healthz (no auth required)
 	if len(p) == 8 && string(p) == "/healthz" {
 		if string(req.Method) == "GET" {
 			return s.buildJSONResp(200, "{\"ok\":true}\n", nil, req.KeepAlive)
 		}
 		return s.buildJSONResp(405, "{\"message\":\"Method Not Allowed\"}\n", nil, req.KeepAlive)
 	}
-	// Fast path 3: /mcp
+	// /mcp
 	if len(p) == 4 && string(p) == "/mcp" {
 		return s.handleMCP(req)
 	}
-	// Fast path 4: Git Smart HTTP /{owner}/{repo}.git/...
+	// Git Smart HTTP /{owner}/{repo}.git/...
 	if bytes.Contains(p, []byte(".git/")) {
 		return s.handleGitHTTP(req)
 	}
