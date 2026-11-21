@@ -689,7 +689,7 @@ func (s *Store) UnpackPackfile(r *Repo, pack []byte) error {
 	hasDeltas := false
 
 	pos := 12
-	var br sliceByteReader
+	br := &s.packReader
 	for i := 0; i < count; i++ {
 		if pos >= trailerStart {
 			return errors.New("truncated pack")
@@ -744,9 +744,9 @@ func (s *Store) UnpackPackfile(r *Repo, pack []byte) error {
 		br.pos = pos
 		var err error
 		if s.zReader == nil {
-			s.zReader, err = zlib.NewReader(&br)
+			s.zReader, err = zlib.NewReader(br)
 		} else {
-			err = s.zReader.(zlib.Resetter).Reset(&br, nil)
+			err = s.zReader.(zlib.Resetter).Reset(br, nil)
 		}
 		if err != nil {
 			return fmt.Errorf("zlib init: %w", err)
@@ -759,8 +759,7 @@ func (s *Store) UnpackPackfile(r *Repo, pack []byte) error {
 				return fmt.Errorf("zlib inflate: %w", err)
 			}
 		}
-		var eofProbe [1]byte
-		if n, err := s.zReader.Read(eofProbe[:]); n != 0 || err != io.EOF {
+		if n, err := s.zReader.Read(s.eofProbe[:]); n != 0 || err != io.EOF {
 			if err == nil {
 				return fmt.Errorf("inflated size mismatch: exceeded declared %d", size)
 			}

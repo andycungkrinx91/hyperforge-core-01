@@ -65,15 +65,32 @@ func (o OID) AppendHex(dst []byte) []byte {
 	return append(dst, buf[:]...)
 }
 
+var hexValTable = func() [256]byte {
+	var t [256]byte
+	for i := range t {
+		t[i] = 0xff
+	}
+	for c := byte('0'); c <= '9'; c++ {
+		t[c] = c - '0'
+	}
+	for c := byte('a'); c <= 'f'; c++ {
+		t[c] = c - 'a' + 10
+	}
+	for c := byte('A'); c <= 'F'; c++ {
+		t[c] = c - 'A' + 10
+	}
+	return t
+}()
+
 func ParseOID(s string) (OID, bool) {
 	var out OID
 	if len(s) != 40 {
 		return out, false
 	}
 	for i := 0; i < 20; i++ {
-		hi, ok1 := fromHex(s[i*2])
-		lo, ok2 := fromHex(s[i*2+1])
-		if !ok1 || !ok2 {
+		hi := hexValTable[s[i*2]]
+		lo := hexValTable[s[i*2+1]]
+		if (hi|lo)&0x80 != 0 {
 			return out, false
 		}
 		out[i] = (hi << 4) | lo
@@ -87,9 +104,9 @@ func ParseOIDBytes(b []byte) (OID, bool) {
 		return out, false
 	}
 	for i := 0; i < 20; i++ {
-		hi, ok1 := fromHex(b[i*2])
-		lo, ok2 := fromHex(b[i*2+1])
-		if !ok1 || !ok2 {
+		hi := hexValTable[b[i*2]]
+		lo := hexValTable[b[i*2+1]]
+		if (hi|lo)&0x80 != 0 {
 			return out, false
 		}
 		out[i] = (hi << 4) | lo
@@ -98,16 +115,8 @@ func ParseOIDBytes(b []byte) (OID, bool) {
 }
 
 func fromHex(c byte) (byte, bool) {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0', true
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10, true
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10, true
-	default:
-		return 0, false
-	}
+	v := hexValTable[c]
+	return v, v != 0xff
 }
 
 // GitObj stores one immutable Git object and pre-parsed metadata for fast traversal.
@@ -231,10 +240,23 @@ type Repo struct {
 	RefGen              uint64
 	cachedRecvSingleRef string
 	cachedRecvOIDOff    int
+	recvPatchRing       [4][]byte
+	recvPatchIdx        int
 
-	// Slab allocators (protected by Store.mu) to eliminate per-object GC churn on push.
-	objSlab  []GitObj
-	dataSlab []byte
+	// Slab allocators (protected by Store.mu) to eliminate per-object GC churn on push/write.
+	objSlab         []GitObj
+	dataSlab        []byte
+	issueSlab       []Issue
+	issueNodePrefix string
+}
+
+func (r *Repo) allocIssue() *Issue {
+	if len(r.issueSlab) == 0 {
+		r.issueSlab = make([]Issue, 64)
+	}
+	is := &r.issueSlab[0]
+	r.issueSlab = r.issueSlab[1:]
+	return is
 }
 
 func (r *Repo) allocObj() *GitObj {
@@ -305,8 +327,16 @@ func (r *Repo) PatchSingleRefCache(ref string, newOID OID) {
 	prevPtr := r.recvCache.Load()
 	if len(r.Refs) == 1 && prevPtr != nil && r.cachedRecvSingleRef == ref && r.cachedRecvOIDOff > 0 && r.cachedRecvOIDOff+40 <= len(*prevPtr) {
 		prev := *prevPtr
-		next := make([]byte, len(prev))
+		idx := r.recvPatchIdx & 3
+		r.recvPatchIdx++
+		next := r.recvPatchRing[idx]
+		if cap(next) < len(prev) {
+			next = make([]byte, len(prev))
+		} else {
+			next = next[:len(prev)]
+		}
 		copy(next, prev)
+		r.recvPatchRing[idx] = next
 		var hexBuf [40]byte
 		for i, b := range newOID {
 			hexBuf[i*2] = hexDigits[b>>4]
@@ -357,6 +387,8 @@ type Store struct {
 	zBuf        bytes.Buffer
 	reportBuf   []byte
 	sidebandBuf []byte
+	packReader  sliceByteReader
+	eofProbe    [1]byte
 }
 
 func NewStore(login, token, trialNow string) *Store {
@@ -426,9 +458,10 @@ func (s *Store) CreateRepo(name, desc string, private bool) (*Repo, bool) {
 		Refs:          make(map[string]OID, 8),
 		HeadRef:       "refs/heads/main",
 		Labels:        make(map[string]*Label, 8),
-		Issues:        make([]*Issue, 0, 16),
-		Pulls:         make([]*PullRequest, 0, 8),
-		RefGen:        1,
+		Issues:          make([]*Issue, 0, 16),
+		Pulls:           make([]*PullRequest, 0, 8),
+		RefGen:          1,
+		issueNodePrefix: "I_" + strconv.Itoa(id) + "_",
 	}
 	emptyIssues := r.Issues
 	r.issuesSnap.Store(&emptyIssues)
@@ -523,8 +556,12 @@ func (s *Store) CreateIssue(r *Repo, title, body string, labelNames []string) (*
 	id := s.NextIssueID
 	s.NextIssueID++
 	num := len(r.Issues) + 1
-	nodeID := "I_" + strconv.Itoa(r.ID) + "_" + strconv.Itoa(num)
-	is := &Issue{
+	var nodeBuf [32]byte
+	nb := append(nodeBuf[:0], r.issueNodePrefix...)
+	nb = strconv.AppendInt(nb, int64(num), 10)
+	nodeID := string(nb)
+	is := r.allocIssue()
+	*is = Issue{
 		ID:        id,
 		NodeID:    nodeID,
 		Repo:      r,

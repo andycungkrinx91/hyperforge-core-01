@@ -129,7 +129,7 @@ func waitForDone(envURL string) {
 
 func main() {
 	runtime.GOMAXPROCS(2)
-	debug.SetGCPercent(1000)
+	debug.SetGCPercent(-1)
 	debug.SetMemoryLimit(768 << 20)
 
 	login := os.Getenv("MAKEFUN_FORGE_LOGIN")

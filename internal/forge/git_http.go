@@ -267,17 +267,20 @@ type pktItem struct {
 }
 
 func parsePktLines(src []byte, stopAtFlush bool) ([]pktItem, int, bool) {
-	var out []pktItem
+	return parsePktLinesInto(src, stopAtFlush, nil)
+}
+
+func parsePktLinesInto(src []byte, stopAtFlush bool, out []pktItem) ([]pktItem, int, bool) {
 	pos := 0
 	for pos < len(src) {
 		if pos+4 > len(src) {
 			return nil, pos, false
 		}
-		h0, ok0 := fromHex(src[pos])
-		h1, ok1 := fromHex(src[pos+1])
-		h2, ok2 := fromHex(src[pos+2])
-		h3, ok3 := fromHex(src[pos+3])
-		if !ok0 || !ok1 || !ok2 || !ok3 {
+		h0 := hexValTable[src[pos]]
+		h1 := hexValTable[src[pos+1]]
+		h2 := hexValTable[src[pos+2]]
+		h3 := hexValTable[src[pos+3]]
+		if (h0|h1|h2|h3)&0x80 != 0 {
 			return nil, pos, false
 		}
 		n := (int(h0) << 12) | (int(h1) << 8) | (int(h2) << 4) | int(h3)
@@ -744,7 +747,8 @@ type pushCmd struct {
 }
 
 func (s *EpollServer) handleGitReceivePack(req *Request, repo *Repo) []byte {
-	pkts, packOff, ok := parsePktLines(req.Body, true)
+	var stackPkts [4]pktItem
+	pkts, packOff, ok := parsePktLinesInto(req.Body, true, stackPkts[:0])
 	if !ok {
 		return s.buildJSONResp(400, "{\"message\":\"malformed receive-pack pkt-line\"}\n", nil, req.KeepAlive)
 	}
